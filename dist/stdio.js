@@ -192,10 +192,37 @@ async function tryGetContentViaGoogleSearch(url) {
 // src/mastra/tools/crawl-site.ts
 var DEFAULT_MAX_URLS = 500;
 var FETCH_TIMEOUT_MS = 2e4;
+var IGNORED_EXTENSIONS = [
+  "css",
+  "js",
+  "png",
+  "jpg",
+  "jpeg",
+  "webp",
+  "eps",
+  "pdf",
+  "doc",
+  "docx",
+  "xls",
+  "xlsx",
+  "ppt",
+  "pptx",
+  "zip",
+  "gz",
+  "tgz",
+  "tar",
+  "bz2",
+  "dmg",
+  "exe",
+  "iso",
+  "mp4",
+  "xml"
+];
 var FALLBACK_SEED_PATHS = [
   "/about",
   "/about-us",
   "/contact",
+  "/contact-us",
   "/our-business",
   "/investors",
   "/sitemap.xml",
@@ -232,6 +259,20 @@ function normalizeUrlString2(url) {
     return u.origin + u.pathname.replace(/\/+/g, "/").replace(/\/$/, "") || u.origin + "/";
   } catch {
     return url;
+  }
+}
+function hasIgnoredExtension(pathname) {
+  const segment = pathname.split("/").filter(Boolean).pop() ?? "";
+  const ext = segment.includes(".") ? segment.split(".").pop()?.toLowerCase() : void 0;
+  return ext ? IGNORED_EXTENSIONS.includes(ext) : false;
+}
+function pathnameMatchesFilter(pathname, filter) {
+  if (!filter || filter.length === 0) return true;
+  if (pathname.startsWith(filter)) return true;
+  try {
+    return new RegExp(filter).test(pathname);
+  } catch {
+    return false;
   }
 }
 async function fetchWithTimeout(url, options = {}) {
@@ -320,7 +361,8 @@ var discoverSiteUrlsTool = createTool({
   description: "Discover same-origin URLs starting from a given URL (step 1 of site analysis).",
   inputSchema: z.object({
     url: z.string().url().describe("Starting URL of the site"),
-    maxUrls: z.number().int().min(1).max(500).optional().default(DEFAULT_MAX_URLS).describe("Max URLs to collect")
+    maxUrls: z.number().int().min(1).max(500).optional().default(DEFAULT_MAX_URLS).describe("Max URLs to collect"),
+    pathnameFilter: z.string().optional().describe("Only follow links whose pathname matches: prefix string or RegExp (e.g. '/' or '^/en/')")
   }),
   outputSchema: z.object({
     urls: z.array(z.string()),
@@ -328,7 +370,7 @@ var discoverSiteUrlsTool = createTool({
     total: z.number(),
     errors: z.array(z.string()).optional()
   }),
-  execute: async ({ url, maxUrls }) => {
+  execute: async ({ url, maxUrls, pathnameFilter }) => {
     const base = new URL(url);
     const baseOrigin = base.origin;
     const limit = maxUrls ?? DEFAULT_MAX_URLS;
@@ -342,47 +384,89 @@ var discoverSiteUrlsTool = createTool({
       });
       headlessUrls = result.urls;
       headlessErrors = result.errors;
-      if (headlessUrls.length > 1) {
+      const filteredHeadless = headlessUrls.filter((n) => {
+        try {
+          const pathname = new URL(n).pathname;
+          return !hasIgnoredExtension(pathname) && pathnameMatchesFilter(pathname, pathnameFilter);
+        } catch {
+          return false;
+        }
+      });
+      if (filteredHeadless.length > 1) {
         return {
-          urls: headlessUrls,
+          urls: filteredHeadless,
           baseUrl: baseOrigin,
-          total: headlessUrls.length,
+          total: filteredHeadless.length,
           errors: headlessErrors.length > 0 ? headlessErrors : void 0
         };
       }
     } catch {
     }
     const normalizedStart = normalizeUrlString2(base.href);
-    const seen = /* @__PURE__ */ new Set([normalizedStart]);
+    const resultUrls = /* @__PURE__ */ new Set();
+    const tried = /* @__PURE__ */ new Set();
+    const inQueue = /* @__PURE__ */ new Set();
     const queue = [normalizedStart];
+    inQueue.add(normalizedStart);
     const errors = [...headlessErrors];
+    function maybeQueue(n) {
+      if (!n || !sameOrigin(baseOrigin, n) || tried.has(n) || resultUrls.has(n) || inQueue.has(n)) return;
+      try {
+        const pathname = new URL(n).pathname;
+        if (hasIgnoredExtension(pathname)) return;
+        if (!pathnameMatchesFilter(pathname, pathnameFilter)) return;
+      } catch {
+        return;
+      }
+      inQueue.add(n);
+      queue.push(n);
+    }
     for (const u of headlessUrls) {
       const n = normalizeUrlString2(u);
-      if (n && sameOrigin(baseOrigin, n) && !seen.has(n)) {
-        seen.add(n);
-        queue.push(n);
+      if (n && sameOrigin(baseOrigin, n) && !inQueue.has(n) && !tried.has(n)) {
+        try {
+          const pathname = new URL(n).pathname;
+          if (!hasIgnoredExtension(pathname) && pathnameMatchesFilter(pathname, pathnameFilter)) {
+            inQueue.add(n);
+            queue.push(n);
+          }
+        } catch {
+        }
       }
     }
     for (const u of sitemapUrls) {
       const n = normalizeUrlString2(u);
-      if (n && !seen.has(n)) {
-        seen.add(n);
-        queue.push(n);
+      if (n && !inQueue.has(n) && !tried.has(n)) {
+        try {
+          const pathname = new URL(n).pathname;
+          if (!hasIgnoredExtension(pathname) && pathnameMatchesFilter(pathname, pathnameFilter)) {
+            inQueue.add(n);
+            queue.push(n);
+          }
+        } catch {
+        }
       }
     }
     if (queue.length <= 1) {
       for (const path of FALLBACK_SEED_PATHS) {
-        const u = baseOrigin + path;
-        const n = normalizeUrlString2(u);
-        if (n && !seen.has(n)) {
-          seen.add(n);
-          queue.push(n);
+        const n = normalizeUrlString2(baseOrigin + (path.startsWith("/") ? path : "/" + path));
+        if (n && !inQueue.has(n)) {
+          try {
+            const pathname = new URL(n).pathname;
+            if (!hasIgnoredExtension(pathname) && pathnameMatchesFilter(pathname, pathnameFilter)) {
+              inQueue.add(n);
+              queue.push(n);
+            }
+          } catch {
+          }
         }
       }
     }
-    while (queue.length > 0 && seen.size < limit) {
+    while (queue.length > 0 && resultUrls.size < limit) {
       const current = queue.shift();
-      seen.add(normalizeUrlString2(current));
+      const norm = normalizeUrlString2(current);
+      tried.add(norm);
+      inQueue.delete(norm);
       try {
         const res = await fetchWithTimeout(current, {
           headers: FETCH_HEADERS,
@@ -395,58 +479,46 @@ var discoverSiteUrlsTool = createTool({
           const fallback = await tryGetContentViaGoogleSearch(current);
           const html2 = fallback && fallback.trim().replace(/^[^<]*/, "").includes("<") ? fallback : null;
           if (html2) {
+            resultUrls.add(norm);
             const $2 = cheerio.load(html2);
-            const links2 = [];
             $2("a[href]").each((_, el) => {
               const href = $2(el).attr("href");
               if (!href) return;
               const normalized = normalizeUrl(pageBase, href);
-              if (normalized && sameOrigin(baseOrigin, normalized) && !seen.has(normalized)) {
-                seen.add(normalized);
-                links2.push(normalized);
-              }
+              if (normalized) maybeQueue(normalized);
             });
-            queue.push(...links2);
           } else {
             errors.push(`${current}: HTTP ${res.status}`);
           }
           continue;
         }
+        resultUrls.add(norm);
         const html = await res.text();
         const $ = cheerio.load(html);
-        const links = [];
         $("a[href]").each((_, el) => {
           const href = $(el).attr("href");
           if (!href) return;
           const normalized = normalizeUrl(pageBase, href);
-          if (normalized && sameOrigin(baseOrigin, normalized) && !seen.has(normalized)) {
-            seen.add(normalized);
-            links.push(normalized);
-          }
+          if (normalized) maybeQueue(normalized);
         });
-        queue.push(...links);
       } catch (e) {
         const fallback = await tryGetContentViaGoogleSearch(current);
         const html = fallback && fallback.trim().replace(/^[^<]*/, "").includes("<") ? fallback : null;
         if (html) {
+          resultUrls.add(norm);
           const $ = cheerio.load(html);
-          const links = [];
           $("a[href]").each((_, el) => {
             const href = $(el).attr("href");
             if (!href) return;
             const normalized = normalizeUrl(current, href);
-            if (normalized && sameOrigin(baseOrigin, normalized) && !seen.has(normalized)) {
-              seen.add(normalized);
-              links.push(normalized);
-            }
+            if (normalized) maybeQueue(normalized);
           });
-          queue.push(...links);
         } else {
           errors.push(`${current}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
     }
-    const urls = Array.from(seen);
+    const urls = resultUrls.size > 0 ? Array.from(resultUrls) : [normalizedStart];
     return { urls, baseUrl: baseOrigin, total: urls.length, errors: errors.length > 0 ? errors : void 0 };
   }
 });
@@ -482,7 +554,7 @@ function getTemplateSignature(html, maxDepth = 4) {
 }
 
 // src/mastra/tools/analyse-and-group-templates.ts
-var DEFAULT_MAX_URLS2 = 80;
+var DEFAULT_MAX_URLS2 = 500;
 function normalizeUrl2(base, href) {
   try {
     if (!href || href.startsWith("#") || href.startsWith("javascript:") || href.startsWith("mailto:")) {

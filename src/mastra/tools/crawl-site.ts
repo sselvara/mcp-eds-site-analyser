@@ -7,11 +7,40 @@ import { tryGetContentViaGoogleSearch } from "./google-search-fallback.js";
 const DEFAULT_MAX_URLS = 500;
 const FETCH_TIMEOUT_MS = 20000;
 
-/** Common path suffixes to try when we have no sitemap and only the start URL (so we have more than one URL to fetch). */
+/** File extensions to skip when discovering links (crawl only HTML pages, not assets/documents). */
+const IGNORED_EXTENSIONS = [
+  "css",
+  "js",
+  "png",
+  "jpg",
+  "jpeg",
+  "webp",
+  "eps",
+  "pdf",
+  "doc",
+  "docx",
+  "xls",
+  "xlsx",
+  "ppt",
+  "pptx",
+  "zip",
+  "gz",
+  "tgz",
+  "tar",
+  "bz2",
+  "dmg",
+  "exe",
+  "iso",
+  "mp4",
+  "xml",
+];
+
+/** Common path suffixes to try when we have no sitemap and only the start URL. */
 const FALLBACK_SEED_PATHS = [
   "/about",
   "/about-us",
   "/contact",
+  "/contact-us",
   "/our-business",
   "/investors",
   "/sitemap.xml",
@@ -55,6 +84,24 @@ function normalizeUrlString(url: string): string {
     return u.origin + u.pathname.replace(/\/+/g, "/").replace(/\/$/, "") || u.origin + "/";
   } catch {
     return url;
+  }
+}
+
+/** True if pathname has an extension in IGNORED_EXTENSIONS (e.g. .pdf, .css). */
+function hasIgnoredExtension(pathname: string): boolean {
+  const segment = pathname.split("/").filter(Boolean).pop() ?? "";
+  const ext = segment.includes(".") ? segment.split(".").pop()?.toLowerCase() : undefined;
+  return ext ? IGNORED_EXTENSIONS.includes(ext) : false;
+}
+
+/** True if pathname matches filter: empty filter => true; otherwise prefix match or RegExp. */
+function pathnameMatchesFilter(pathname: string, filter: string | undefined): boolean {
+  if (!filter || filter.length === 0) return true;
+  if (pathname.startsWith(filter)) return true;
+  try {
+    return new RegExp(filter).test(pathname);
+  } catch {
+    return false;
   }
 }
 
@@ -163,6 +210,10 @@ export const discoverSiteUrlsTool = createTool({
   inputSchema: z.object({
     url: z.string().url().describe("Starting URL of the site"),
     maxUrls: z.number().int().min(1).max(500).optional().default(DEFAULT_MAX_URLS).describe("Max URLs to collect"),
+    pathnameFilter: z
+      .string()
+      .optional()
+      .describe("Only follow links whose pathname matches: prefix string or RegExp (e.g. '/' or '^/en/')"),
   }),
   outputSchema: z.object({
     urls: z.array(z.string()),
@@ -170,7 +221,7 @@ export const discoverSiteUrlsTool = createTool({
     total: z.number(),
     errors: z.array(z.string()).optional(),
   }),
-  execute: async ({ url, maxUrls }) => {
+  execute: async ({ url, maxUrls, pathnameFilter }) => {
     const base = new URL(url);
     const baseOrigin = base.origin;
     const limit = maxUrls ?? DEFAULT_MAX_URLS;
@@ -187,12 +238,20 @@ export const discoverSiteUrlsTool = createTool({
       });
       headlessUrls = result.urls;
       headlessErrors = result.errors;
-      // If headless returned enough URLs, use them.
-      if (headlessUrls.length > 1) {
+      // Filter headless URLs by extension and pathname (same rules as fetch-based crawl).
+      const filteredHeadless = headlessUrls.filter((n) => {
+        try {
+          const pathname = new URL(n).pathname;
+          return !hasIgnoredExtension(pathname) && pathnameMatchesFilter(pathname, pathnameFilter);
+        } catch {
+          return false;
+        }
+      });
+      if (filteredHeadless.length > 1) {
         return {
-          urls: headlessUrls,
+          urls: filteredHeadless,
           baseUrl: baseOrigin,
-          total: headlessUrls.length,
+          total: filteredHeadless.length,
           errors: headlessErrors.length > 0 ? headlessErrors : undefined,
         };
       }
@@ -202,40 +261,82 @@ export const discoverSiteUrlsTool = createTool({
 
     // Fetch-based discovery: when headless isn't used, under-delivered (≤1 URL), or threw.
     const normalizedStart = normalizeUrlString(base.href);
-    const seen = new Set<string>([normalizedStart]);
+    /** URLs to include in the result: only those we successfully fetched (2xx or fallback HTML). */
+    const resultUrls = new Set<string>();
+    /** URLs we've already attempted (so we don't re-queue). */
+    const tried = new Set<string>();
+    /** URLs currently in queue (so we don't push duplicates). */
+    const inQueue = new Set<string>();
     const queue: string[] = [normalizedStart];
+    inQueue.add(normalizedStart);
     const errors: string[] = [...headlessErrors];
+
+    function maybeQueue(n: string): void {
+      if (!n || !sameOrigin(baseOrigin, n) || tried.has(n) || resultUrls.has(n) || inQueue.has(n)) return;
+      try {
+        const pathname = new URL(n).pathname;
+        if (hasIgnoredExtension(pathname)) return;
+        if (!pathnameMatchesFilter(pathname, pathnameFilter)) return;
+      } catch {
+        return;
+      }
+      inQueue.add(n);
+      queue.push(n);
+    }
 
     for (const u of headlessUrls) {
       const n = normalizeUrlString(u);
-      if (n && sameOrigin(baseOrigin, n) && !seen.has(n)) {
-        seen.add(n);
-        queue.push(n);
+      if (n && sameOrigin(baseOrigin, n) && !inQueue.has(n) && !tried.has(n)) {
+        try {
+          const pathname = new URL(n).pathname;
+          if (!hasIgnoredExtension(pathname) && pathnameMatchesFilter(pathname, pathnameFilter)) {
+            inQueue.add(n);
+            queue.push(n);
+          }
+        } catch {
+          // skip invalid
+        }
       }
     }
     for (const u of sitemapUrls) {
       const n = normalizeUrlString(u);
-      if (n && !seen.has(n)) {
-        seen.add(n);
-        queue.push(n);
-      }
-    }
-
-    // When we still have only one URL to try, seed with common paths so we have more chances to get links (e.g. if homepage times out).
-    if (queue.length <= 1) {
-      for (const path of FALLBACK_SEED_PATHS) {
-        const u = baseOrigin + path;
-        const n = normalizeUrlString(u);
-        if (n && !seen.has(n)) {
-          seen.add(n);
-          queue.push(n);
+      if (n && !inQueue.has(n) && !tried.has(n)) {
+        try {
+          const pathname = new URL(n).pathname;
+          if (!hasIgnoredExtension(pathname) && pathnameMatchesFilter(pathname, pathnameFilter)) {
+            inQueue.add(n);
+            queue.push(n);
+          }
+        } catch {
+          // skip invalid
         }
       }
     }
 
-    while (queue.length > 0 && seen.size < limit) {
+    // When we still have only one URL to try, seed with common paths (e.g. if homepage times out).
+    if (queue.length <= 1) {
+      for (const path of FALLBACK_SEED_PATHS) {
+        const n = normalizeUrlString(baseOrigin + (path.startsWith("/") ? path : "/" + path));
+        if (n && !inQueue.has(n)) {
+          try {
+            const pathname = new URL(n).pathname;
+            if (!hasIgnoredExtension(pathname) && pathnameMatchesFilter(pathname, pathnameFilter)) {
+              inQueue.add(n);
+              queue.push(n);
+            }
+          } catch {
+            // skip
+          }
+        }
+      }
+    }
+
+    while (queue.length > 0 && resultUrls.size < limit) {
       const current = queue.shift()!;
-      seen.add(normalizeUrlString(current));
+      const norm = normalizeUrlString(current);
+      tried.add(norm);
+      inQueue.delete(norm);
+
       try {
         const res = await fetchWithTimeout(current, {
           headers: FETCH_HEADERS,
@@ -248,59 +349,47 @@ export const discoverSiteUrlsTool = createTool({
           const fallback = await tryGetContentViaGoogleSearch(current);
           const html = fallback && fallback.trim().replace(/^[^<]*/, "").includes("<") ? fallback : null;
           if (html) {
+            resultUrls.add(norm);
             const $ = cheerio.load(html);
-            const links: string[] = [];
             $("a[href]").each((_, el) => {
               const href = $(el).attr("href");
               if (!href) return;
               const normalized = normalizeUrl(pageBase, href);
-              if (normalized && sameOrigin(baseOrigin, normalized) && !seen.has(normalized)) {
-                seen.add(normalized);
-                links.push(normalized);
-              }
+              if (normalized) maybeQueue(normalized);
             });
-            queue.push(...links);
           } else {
             errors.push(`${current}: HTTP ${res.status}`);
           }
           continue;
         }
+        resultUrls.add(norm);
         const html = await res.text();
         const $ = cheerio.load(html);
-        const links: string[] = [];
         $("a[href]").each((_, el) => {
           const href = $(el).attr("href");
           if (!href) return;
           const normalized = normalizeUrl(pageBase, href);
-          if (normalized && sameOrigin(baseOrigin, normalized) && !seen.has(normalized)) {
-            seen.add(normalized);
-            links.push(normalized);
-          }
+          if (normalized) maybeQueue(normalized);
         });
-        queue.push(...links);
       } catch (e) {
         const fallback = await tryGetContentViaGoogleSearch(current);
         const html = fallback && fallback.trim().replace(/^[^<]*/, "").includes("<") ? fallback : null;
         if (html) {
+          resultUrls.add(norm);
           const $ = cheerio.load(html);
-          const links: string[] = [];
           $("a[href]").each((_, el) => {
             const href = $(el).attr("href");
             if (!href) return;
             const normalized = normalizeUrl(current, href);
-            if (normalized && sameOrigin(baseOrigin, normalized) && !seen.has(normalized)) {
-              seen.add(normalized);
-              links.push(normalized);
-            }
+            if (normalized) maybeQueue(normalized);
           });
-          queue.push(...links);
         } else {
           errors.push(`${current}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
     }
 
-    const urls = Array.from(seen);
+    const urls = resultUrls.size > 0 ? Array.from(resultUrls) : [normalizedStart];
     return { urls, baseUrl: baseOrigin, total: urls.length, errors: errors.length > 0 ? errors : undefined };
   },
 });

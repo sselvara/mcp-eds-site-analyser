@@ -4,7 +4,7 @@ import { z } from "zod";
 import { tryGetContentViaGoogleSearch } from "./google-search-fallback.js";
 import { getTemplateSignature } from "./template-signature.js";
 
-const DEFAULT_MAX_URLS = 80;
+const DEFAULT_MAX_URLS = 500;
 
 function normalizeUrl(base: string, href: string): string | null {
   try {
