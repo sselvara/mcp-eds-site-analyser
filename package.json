@@ -1,0 +1,28 @@
+{
+  "name": "eds-site-analyser",
+  "version": "1.0.0",
+  "description": "MCP server to analyse website URLs and group pages by templates (Mastra)",
+  "type": "module",
+  "bin": "dist/stdio.js",
+  "scripts": {
+    "build": "tsup src/mastra/stdio.ts --format esm --no-splitting --dts",
+    "build:mcp": "tsup src/mastra/stdio.ts --format esm --no-splitting --dts",
+    "dev": "tsx src/mastra/stdio.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@mastra/core": "latest",
+    "@mastra/mcp": "latest",
+    "cheerio": "^1.0.0",
+    "zod": "^3.23.0",
+    "playwright": "^1.49.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

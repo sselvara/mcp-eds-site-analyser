@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "eds-site-analyser": {
+      "command": "node",
+      "args": ["/absolute/path/to/eds-site-analyser/dist/stdio.js"]
+    },
+    "google-search": {
+      "command": "npx",
+      "args": [
+        "https://github.com/ACSGenUI/mcp-google-search#release"
+      ]
+    }
+  }
+}
